@@ -10,7 +10,8 @@
   .box { background:white; padding:14px; border-radius:12px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
   label { display:block; margin:10px 0 4px; font-weight:bold; }
   input { font-size:18px; padding:8px; width:90px; }
-  button { font-size:18px; padding:12px 18px; border:0; border-radius:10px; background:#1b6b49; color:white; margin-top:12px; }
+  input[type="text"] { width: 100%; max-width: 300px; box-sizing: border-box; }
+  button { font-size:18px; padding:12px 18px; border:0; border-radius:10px; background:#1b6b49; color:white; margin-top:12px; cursor: pointer; }
   .route { background:white; padding:12px; margin:10px 0; border-radius:10px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
   .naam { font-size:18px; font-weight:bold; }
   .afstand { color:#555; margin-top:4px; }
@@ -24,7 +25,10 @@
 <h2>🥾 Wandelroutes in de buurt</h2>
 
 <div class="box">
-  <label for="straalKm">Straal rond huidige locatie</label>
+  <label for="handmatigeLocatie">Eigen locatie invoeren (optioneel)</label>
+  <input id="handmatigeLocatie" type="text" placeholder="Bijv. Valence, of laat leeg voor GPS">
+
+  <label for="straalKm">Straal rond locatie</label>
   <input id="straalKm" type="number" value="15" min="1" max="50" step="1"> km
 
   <label for="minKm">Minimum afstand</label>
@@ -34,13 +38,13 @@
   <input id="maxKm" type="number" value="20" min="1" max="80" step="0.5"> km
 
   <br>
-  <button onclick="zoekRoutes()">Zoek wandelroutes</button>
+  <button onclick="startZoektocht()">Zoek wandelroutes</button>
 </div>
 
 <div class="box">
   <b>Status</b>
   <div id="status">Wachten...</div>
-  <div class="small">Tip: open dit liefst via https:// of http://localhost. Bij een lokaal bestand kan GPS soms moeilijk doen.</div>
+  <div class="small">Tip: open dit liefst via https:// of http://localhost wanneer je GPS gebruikt.</div>
 </div>
 
 <div id="resultaten"></div>
@@ -107,26 +111,71 @@ async function fetchOverpass(query) {
   throw new Error(laatsteFout || "Geen enkele Overpass-server antwoordde.");
 }
 
-function zoekRoutes() {
-  document.getElementById("resultaten").innerHTML = "";
-
-  if (!navigator.geolocation) {
-    setStatus("Deze browser ondersteunt geen GPS-locatie.");
-    return;
+async function geocodeLocatie(adres) {
+  setStatus(`Locatie "${adres}" zoeken...`);
+  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(adres)}&limit=1`;
+  
+  try {
+    const response = await fetch(url, {
+      headers: { "User-Agent": "WandelrouteZoeker/1.0" } // Nominatim vereist een User-Agent
+    });
+    const data = await response.json();
+    if (data && data.length > 0) {
+      return {
+        lat: parseFloat(data[0].lat),
+        lon: parseFloat(data[0].lon),
+        naam: data[0].display_name
+      };
+    }
+    throw new Error("Locatie niet gevonden.");
+  } catch (e) {
+    throw new Error("Fout bij het opzoeken van de locatie: " + e.message);
   }
+}
 
+function startZoektocht() {
+  document.getElementById("resultaten").innerHTML = "";
+  const handmatigeLocatie = document.getElementById("handmatigeLocatie").value.trim();
+
+  if (handmatigeLocatie !== "") {
+    // Gebruik de ingevoerde tekstlocatie
+    geocodeLocatie(handmatigeLocatie)
+      .then(coords => {
+        zoekRoutes(coords.lat, coords.lon, coords.naam);
+      })
+      .catch(err => {
+        setStatus(err.message);
+      });
+  } else {
+    // Gebruik browser GPS
+    if (!navigator.geolocation) {
+      setStatus("Deze browser ondersteunt geen GPS-locatie. Voer handmatig een locatie in.");
+      return;
+    }
+
+    setStatus("GPS Locatie bepalen...\nKies Toestaan wanneer de browser erom vraagt.");
+
+    navigator.geolocation.getCurrentPosition(pos => {
+      zoekRoutes(pos.coords.latitude, pos.coords.longitude, "jouw GPS-locatie");
+    }, err => {
+      setStatus("De GPS-locatie werd niet vrijgegeven.\nTyp handmatig een locatie in, of controleer de site-instellingen.\n\nCode: " + err.code + " - " + err.message);
+    }, {
+      enableHighAccuracy: true,
+      timeout: 20000,
+      maximumAge: 60000
+    });
+  }
+}
+
+async function zoekRoutes(lat, lon, locatieNaam) {
   const straalKm = parseFloat(document.getElementById("straalKm").value || "15");
   const minKm = parseFloat(document.getElementById("minKm").value || "4");
   const maxKm = parseFloat(document.getElementById("maxKm").value || "20");
   const straalMeter = Math.round(straalKm * 1000);
 
-  setStatus("Locatie bepalen...\nKies Toestaan wanneer Chrome erom vraagt.");
+  setStatus(`Routes zoeken rondom:\n${locatieNaam}...`);
 
-  navigator.geolocation.getCurrentPosition(async pos => {
-    const lat = pos.coords.latitude;
-    const lon = pos.coords.longitude;
-
-    const query = `
+  const query = `
 [out:json][timeout:45];
 (
   relation(around:${straalMeter},${lat},${lon})["type"="route"]["route"~"hiking|foot|walking"];
@@ -134,38 +183,31 @@ function zoekRoutes() {
 out tags center;
 `;
 
-    try {
-      const data = await fetchOverpass(query);
+  try {
+    const data = await fetchOverpass(query);
 
-      let routes = (data.elements || []).map(r => {
-        const tags = r.tags || {};
-        const afstand = parseAfstand(tags.distance || tags.length || tags.dist);
-        const center = r.center || null;
-        const afstandTotRoute = center ? afstandMeter(lat, lon, center.lat, center.lon) / 1000 : null;
-        return {
-          naam: tags.name || tags.ref || "Naamloze wandelroute",
-          afstand,
-          netwerk: tags.network || "",
-          operator: tags.operator || "",
-          id: r.id,
-          afstandTotRoute
-        };
-      })
-      .filter(r => r.afstand !== null && r.afstand >= minKm && r.afstand <= maxKm)
-      .sort((a,b) => a.afstand - b.afstand);
+    let routes = (data.elements || []).map(r => {
+      const tags = r.tags || {};
+      const afstand = parseAfstand(tags.distance || tags.length || tags.dist);
+      const center = r.center || null;
+      const afstandTotRoute = center ? afstandMeter(lat, lon, center.lat, center.lon) / 1000 : null;
+      return {
+        naam: tags.name || tags.ref || "Naamloze wandelroute",
+        afstand,
+        netwerk: tags.network || "",
+        operator: tags.operator || "",
+        id: r.id,
+        afstandTotRoute
+      };
+    })
+    .filter(r => r.afstand !== null && r.afstand >= minKm && r.afstand <= maxKm)
+    .sort((a,b) => a.afstand - b.afstand);
 
-      toonRoutes(routes, data.elements ? data.elements.length : 0);
+    toonRoutes(routes, data.elements ? data.elements.length : 0);
 
-    } catch (e) {
-      setStatus("Fout bij het ophalen van routes.\n\nTechnische melding:\n" + e.message + "\n\nMogelijke oorzaken:\n- tijdelijke storing of drukte bij Overpass\n- internetverbinding blokkeert de aanvraag\n- routegegevens in deze streek bevatten geen afstand");
-    }
-  }, err => {
-    setStatus("De locatie werd niet vrijgegeven.\nControleer Android → Instellingen → Locatie, en Chrome → Site-instellingen → Locatie.\n\nCode: " + err.code + " - " + err.message);
-  }, {
-    enableHighAccuracy: true,
-    timeout: 20000,
-    maximumAge: 60000
-  });
+  } catch (e) {
+    setStatus("Fout bij het ophalen van routes.\n\nTechnische melding:\n" + e.message + "\n\nMogelijke oorzaken:\n- tijdelijke storing of drukte bij Overpass\n- internetverbinding blokkeert de aanvraag\n- routegegevens in deze streek bevatten geen afstand");
+  }
 }
 
 function toonRoutes(routes, totaal) {
@@ -179,7 +221,7 @@ function toonRoutes(routes, totaal) {
   setStatus(routes.length + " route(s) gevonden.");
 
   routes.forEach(r => {
-    const afstandTot = r.afstandTotRoute === null ? "" : `<div>Ongeveer ${r.afstandTotRoute.toFixed(1)} km van je positie</div>`;
+    const afstandTot = r.afstandTotRoute === null ? "" : `<div>Ongeveer ${r.afstandTotRoute.toFixed(1)} km van de gekozen locatie</div>`;
     div.innerHTML += `
       <div class="route">
         <div class="naam">🥾 ${escapeHtml(r.naam)}</div>
