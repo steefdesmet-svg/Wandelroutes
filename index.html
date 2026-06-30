@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wandelroutes in de buurt</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 16px; background:#f5f5f5; color:#1f2a24; }
+  h2 { margin-top:0; }
+  .box { background:white; padding:14px; border-radius:12px; margin-bottom:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  label { display:block; margin:10px 0 4px; font-weight:bold; }
+  input { font-size:18px; padding:8px; width:90px; }
+  button { font-size:18px; padding:12px 18px; border:0; border-radius:10px; background:#1b6b49; color:white; margin-top:12px; }
+  .route { background:white; padding:12px; margin:10px 0; border-radius:10px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .naam { font-size:18px; font-weight:bold; }
+  .afstand { color:#555; margin-top:4px; }
+  a { display:inline-block; margin-top:8px; color:#0b5cad; }
+  #status { white-space:pre-line; }
+  .small { font-size:13px; color:#666; }
+</style>
+</head>
+<body>
+
+<h2>🥾 Wandelroutes in de buurt</h2>
+
+<div class="box">
+  <label for="straalKm">Straal rond huidige locatie</label>
+  <input id="straalKm" type="number" value="15" min="1" max="50" step="1"> km
+
+  <label for="minKm">Minimum afstand</label>
+  <input id="minKm" type="number" value="4" min="0" max="50" step="0.5"> km
+
+  <label for="maxKm">Maximum afstand</label>
+  <input id="maxKm" type="number" value="20" min="1" max="80" step="0.5"> km
+
+  <br>
+  <button onclick="zoekRoutes()">Zoek wandelroutes</button>
+</div>
+
+<div class="box">
+  <b>Status</b>
+  <div id="status">Wachten...</div>
+  <div class="small">Tip: open dit liefst via https:// of http://localhost. Bij een lokaal bestand kan GPS soms moeilijk doen.</div>
+</div>
+
+<div id="resultaten"></div>
+
+<script>
+const OVERPASS_URLS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.openstreetmap.ru/api/interpreter"
+];
+
+function setStatus(msg) {
+  document.getElementById("status").textContent = msg;
+}
+
+function parseAfstand(tekst) {
+  if (!tekst) return null;
+  tekst = String(tekst).toLowerCase().replace(",", ".");
+
+  let m = tekst.match(/([0-9]+(?:\.[0-9]+)?)\s*km/);
+  if (m) return parseFloat(m[1]);
+
+  m = tekst.match(/([0-9]+(?:\.[0-9]+)?)\s*m\b/);
+  if (m) return parseFloat(m[1]) / 1000;
+
+  m = tekst.match(/([0-9]+(?:\.[0-9]+)?)/);
+  if (m) return parseFloat(m[1]);
+
+  return null;
+}
+
+function afstandMeter(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = x => x * Math.PI / 180;
+  const dLat = toRad(lat2-lat1);
+  const dLon = toRad(lon2-lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+async function fetchOverpass(query) {
+  let laatsteFout = "";
+
+  for (const endpoint of OVERPASS_URLS) {
+    try {
+      setStatus("Routes zoeken via:\n" + endpoint);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: "data=" + encodeURIComponent(query)
+      });
+
+      if (!response.ok) {
+        laatsteFout = endpoint + " gaf HTTP " + response.status;
+        continue;
+      }
+
+      return await response.json();
+    } catch (e) {
+      laatsteFout = endpoint + " → " + e.message;
+    }
+  }
+
+  throw new Error(laatsteFout || "Geen enkele Overpass-server antwoordde.");
+}
+
+function zoekRoutes() {
+  document.getElementById("resultaten").innerHTML = "";
+
+  if (!navigator.geolocation) {
+    setStatus("Deze browser ondersteunt geen GPS-locatie.");
+    return;
+  }
+
+  const straalKm = parseFloat(document.getElementById("straalKm").value || "15");
+  const minKm = parseFloat(document.getElementById("minKm").value || "4");
+  const maxKm = parseFloat(document.getElementById("maxKm").value || "20");
+  const straalMeter = Math.round(straalKm * 1000);
+
+  setStatus("Locatie bepalen...\nKies Toestaan wanneer Chrome erom vraagt.");
+
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const lat = pos.coords.latitude;
+    const lon = pos.coords.longitude;
+
+    const query = `
+[out:json][timeout:45];
+(
+  relation(around:${straalMeter},${lat},${lon})["type"="route"]["route"~"hiking|foot|walking"];
+);
+out tags center;
+`;
+
+    try {
+      const data = await fetchOverpass(query);
+
+      let routes = (data.elements || []).map(r => {
+        const tags = r.tags || {};
+        const afstand = parseAfstand(tags.distance || tags.length || tags.dist);
+        const center = r.center || null;
+        const afstandTotRoute = center ? afstandMeter(lat, lon, center.lat, center.lon) / 1000 : null;
+        return {
+          naam: tags.name || tags.ref || "Naamloze wandelroute",
+          afstand,
+          netwerk: tags.network || "",
+          operator: tags.operator || "",
+          id: r.id,
+          afstandTotRoute
+        };
+      })
+      .filter(r => r.afstand !== null && r.afstand >= minKm && r.afstand <= maxKm)
+      .sort((a,b) => a.afstand - b.afstand);
+
+      toonRoutes(routes, data.elements ? data.elements.length : 0);
+
+    } catch (e) {
+      setStatus("Fout bij het ophalen van routes.\n\nTechnische melding:\n" + e.message + "\n\nMogelijke oorzaken:\n- tijdelijke storing of drukte bij Overpass\n- internetverbinding blokkeert de aanvraag\n- routegegevens in deze streek bevatten geen afstand");
+    }
+  }, err => {
+    setStatus("De locatie werd niet vrijgegeven.\nControleer Android → Instellingen → Locatie, en Chrome → Site-instellingen → Locatie.\n\nCode: " + err.code + " - " + err.message);
+  }, {
+    enableHighAccuracy: true,
+    timeout: 20000,
+    maximumAge: 60000
+  });
+}
+
+function toonRoutes(routes, totaal) {
+  const div = document.getElementById("resultaten");
+
+  if (routes.length === 0) {
+    setStatus("Er werden " + totaal + " wandelroute-records gevonden, maar geen met een afstand tussen je ingestelde minimum en maximum.\n\nProbeer eventueel minimum 0 km en maximum 80 km. Sommige OSM-routes hebben geen afstandsveld en worden daarom niet getoond.");
+    return;
+  }
+
+  setStatus(routes.length + " route(s) gevonden.");
+
+  routes.forEach(r => {
+    const afstandTot = r.afstandTotRoute === null ? "" : `<div>Ongeveer ${r.afstandTotRoute.toFixed(1)} km van je positie</div>`;
+    div.innerHTML += `
+      <div class="route">
+        <div class="naam">🥾 ${escapeHtml(r.naam)}</div>
+        <div class="afstand">Afstand route: ${r.afstand.toFixed(1)} km</div>
+        ${afstandTot}
+        <div>Netwerk: ${escapeHtml(r.netwerk || "onbekend")}</div>
+        ${r.operator ? `<div>Beheerder: ${escapeHtml(r.operator)}</div>` : ""}
+        <a target="_blank" href="https://www.openstreetmap.org/relation/${r.id}">Bekijk op OpenStreetMap</a>
+      </div>
+    `;
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+}
+</script>
+
+</body>
+</html>
